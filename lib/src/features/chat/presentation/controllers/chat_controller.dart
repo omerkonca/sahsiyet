@@ -1,42 +1,77 @@
 import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:sahsiyet/src/core/database/database_service.dart';
+import 'package:sahsiyet/src/core/services/gemini_service.dart';
 import 'package:sahsiyet/src/features/chat/domain/chat_message_model.dart';
 import 'package:uuid/uuid.dart';
 
 class ChatState {
   final List<ChatMessageModel> messages;
   final bool isTyping;
+  final bool isLoading;
 
   ChatState({
     required this.messages,
     this.isTyping = false,
+    this.isLoading = false,
   });
 
   ChatState copyWith({
     List<ChatMessageModel>? messages,
     bool? isTyping,
+    bool? isLoading,
   }) {
     return ChatState(
       messages: messages ?? this.messages,
       isTyping: isTyping ?? this.isTyping,
+      isLoading: isLoading ?? this.isLoading,
     );
   }
 }
 
 class ChatController extends StateNotifier<ChatState> {
-  ChatController() : super(ChatState(messages: [])) {
-    // Initial welcome message
-    _addMessage(
-       ChatMessageModel(
-        id: 'welcome',
-        text: 'Selamunaleyküm! Ben Şahsiyet rehberin. Bugün senin için ne yapabilirim? Dertleşmek, bir soru sormak veya sadece sohbet etmek istersen buradayım.',
-        isUser: false,
-        timestamp: DateTime.now(), // const constructor sorunu olmaması için
-      ),
-    );
+  ChatController() : super(ChatState(messages: [], isLoading: true)) {
+    _loadChatHistory();
   }
 
-  void sendMessage(String text) {
+  Future<void> _loadChatHistory() async {
+    try {
+      final history = await DatabaseService.getAllChatHistory();
+      
+      if (history.isEmpty) {
+        // Add welcome message
+        final welcomeMsg = ChatMessageModel(
+          id: 'welcome',
+          text: 'Selamunaleyküm! Ben Şahsiyet rehberin. Bugün senin için ne yapabilirim? Dertleşmek, bir soru sormak veya sadece sohbet etmek istersen buradayım.',
+          isUser: false,
+          timestamp: DateTime.now(),
+        );
+        
+        await DatabaseService.insertChatMessage({
+          'message_id': welcomeMsg.id,
+          'text': welcomeMsg.text,
+          'is_user': 0,
+          'timestamp': welcomeMsg.timestamp.toIso8601String(),
+        });
+        
+        state = state.copyWith(messages: [welcomeMsg], isLoading: false);
+      } else {
+        final messages = history.map((msg) => ChatMessageModel(
+          id: msg['message_id'],
+          text: msg['text'],
+          isUser: msg['is_user'] == 1,
+          timestamp: DateTime.parse(msg['timestamp']),
+        )).toList();
+        
+        state = state.copyWith(messages: messages, isLoading: false);
+      }
+    } catch (e) {
+      print('Error loading chat history: $e');
+      state = state.copyWith(isLoading: false);
+    }
+  }
+
+  Future<void> sendMessage(String text) async {
     if (text.trim().isEmpty) return;
 
     // 1. Add User Message
@@ -47,49 +82,68 @@ class ChatController extends StateNotifier<ChatState> {
       timestamp: DateTime.now(),
     );
     _addMessage(userMsg);
+    
+    // Save to database
+    await DatabaseService.insertChatMessage({
+      'message_id': userMsg.id,
+      'text': userMsg.text,
+      'is_user': 1,
+      'timestamp': userMsg.timestamp.toIso8601String(),
+    });
 
-    // 2. Simulate AI Typing
+    // 2. Show AI typing
     state = state.copyWith(isTyping: true);
 
-    // 3. Simulated Delay & Response
-    Future.delayed(const Duration(milliseconds: 1500), () {
+    try {
+      // 3. Get AI Response
+      final response = await GeminiService.getChatResponse(text);
+      
       state = state.copyWith(isTyping: false);
       
       final aiMsg = ChatMessageModel(
         id: const Uuid().v4(),
-        text: _getMockResponse(text),
+        text: response,
         isUser: false,
         timestamp: DateTime.now(),
       );
       _addMessage(aiMsg);
-    });
+      
+      // Save to database
+      await DatabaseService.insertChatMessage({
+        'message_id': aiMsg.id,
+        'text': aiMsg.text,
+        'is_user': 0,
+        'timestamp': aiMsg.timestamp.toIso8601String(),
+      });
+    } catch (e) {
+      state = state.copyWith(isTyping: false);
+      print('Error getting AI response: $e');
+    }
   }
 
   void _addMessage(ChatMessageModel message) {
     state = state.copyWith(messages: [...state.messages, message]);
   }
 
-  // Basit anahtar kelime tabanlı cevaplar
-  String _getMockResponse(String input) {
-    final lowerInput = input.toLowerCase();
+  Future<void> clearHistory() async {
+    await DatabaseService.clearChatHistory();
+    state = ChatState(messages: []);
     
-    if (lowerInput.contains('selam') || lowerInput.contains('merhaba')) {
-      return 'Aleykümselam güzel kardeşim. Günün hayr olsun.';
-    }
-    if (lowerInput.contains('nasılsın')) {
-      return 'Elhamdülillah, seninle sohbet etmek beni her zaman mutlu eder. Sen nasılsın?';
-    }
-    if (lowerInput.contains('namaz')) {
-      return 'Namaz, dinin direği ve müminin miracıdır. Namazla ilgili aklına takılan özel bir şey var mı?';
-    }
-    if (lowerInput.contains('üzgünüm') || lowerInput.contains('sıkıntı')) {
-      return 'Allah sabredenlerle beraberdir (Bakara, 153). Her zorlukla beraber bir kolaylık vardır. Kalbini ferah tut, bu günler de geçer inşallah.';
-    }
-    if (lowerInput.contains('dua')) {
-      return 'Senin için dua edeceğim. "Rabbimiz! Bize dünyada da iyilik ver, ahirette de iyilik ver ve bizi ateş azabından koru." (Bakara, 201)';
-    }
+    // Add welcome message again
+    final welcomeMsg = ChatMessageModel(
+      id: 'welcome',
+      text: 'Selamunaleyküm! Ben Şahsiyet rehberin. Bugün senin için ne yapabilirim?',
+      isUser: false,
+      timestamp: DateTime.now(),
+    );
+    _addMessage(welcomeMsg);
     
-    return 'Anlıyorum. Bu konuda sana daha fazla yardımcı olabilmem için biraz daha detay verir misin?';
+    await DatabaseService.insertChatMessage({
+      'message_id': welcomeMsg.id,
+      'text': welcomeMsg.text,
+      'is_user': 0,
+      'timestamp': welcomeMsg.timestamp.toIso8601String(),
+    });
   }
 }
 
